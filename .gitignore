@@ -13,3 +13,5 @@ __pycache__/
 # Secret keys
 *.json
 service-account-key.json
+# Secret API keys
+.env
