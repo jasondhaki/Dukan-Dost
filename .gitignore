@@ -1,0 +1,15 @@
+# Virtual Environment
+venv/
+
+# Python cache
+__pycache__/
+
+# VSCode settings
+.vscode/
+
+# Databases
+*.db
+
+# Secret keys
+*.json
+service-account-key.json
