@@ -15,3 +15,10 @@ __pycache__/
 service-account-key.json
 # Secret API keys
 .env
+
+# Ignore executables and libraries
+*.exe
+*.dll
+
+# BUT, do NOT ignore ngrok.exe
+!ngrok.exe
