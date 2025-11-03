@@ -9,6 +9,9 @@ import database  # This will now import your new inventory functions
 from typing import Optional
 from dotenv import load_dotenv
 import requests
+import numpy as np         # <--- ADD THIS
+import cv2                 # <--- ADD THIS
+import easyocr             # <--- ADD THIS
 
 # Load .env secrets
 load_dotenv()
@@ -16,6 +19,11 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 app = FastAPI()
+# NEW: Initialize the OCR Reader (This runs once on startup)
+# It will download the models the first time it runs
+print("Loading EasyOCR models (bn=Bengali, en=English)...")
+ocr_reader = easyocr.Reader(['bn', 'en'])
+print("EasyOCR models loaded.")
 
 # --- DAY 3'S VOICE FUNCTION (Unchanged) ---
 def transcribe_audio_google(audio_url: str) -> str:
@@ -55,59 +63,87 @@ def transcribe_audio_google(audio_url: str) -> str:
         return "ERROR: AI service failed."
 
 
-# --- NEW FUNCTION FOR DAY 4 ---
+# --- NEW FUNCTION FOR DAY 5 (Fuzzier Parser) ---
 def parse_message(text: str) -> dict:
     """
     A simple parser to find item, quantity, and price.
-    This is the "AI" for the hackathon.
-    Example: "আজকের বিক্রি ৫ কেজি চাল ২৫০ টাকা"
+    This version is "fuzzier" to handle OCR errors.
     """
-    # Keywords we are looking for (must match database.py)
     known_items = ['চাল', 'ডাল', 'hello']
-
-    words = text.split() # Split the text into a list of words
-
+    
+    words = text.split() 
+    
     parsed_data = {
         "item_name": None,
         "quantity": None,
         "price": None
     }
-
+    
     try:
-        # 1. Find the item
-        for word in words:
-            if word in known_items:
-                parsed_data["item_name"] = word
-                break # Found it!
-
-        # 2. Find the quantity (look for 'কেজি' or 'kg')
+        # Loop through words to find both item name and quantity
         for i, word in enumerate(words):
-            if word == 'কেজি' or word == 'kg':
-                if i > 0 and words[i-1].isdigit(): # Make sure there's a number before it
-                    parsed_data["quantity"] = int(words[i-1])
-                    break
+            # 1. Find the Item Name (Accept 'I' as a typo for 'ল')
+            if 'চাল' in word or 'চান' in word or 'চIন' in word:
+                # Standardize the item name to 'চাল'
+                parsed_data["item_name"] = 'চাল'
+            elif 'ডাল' in word:
+                parsed_data["item_name"] = 'ডাল'
+            elif 'hello' in word:
+                 parsed_data["item_name"] = 'hello'
 
-        # 3. Find the price (look for 'টাকা' or 'taka')
-        for i, word in enumerate(words):
-            if word == 'টাকা' or word == 'taka':
-                if i > 0 and words[i-1].isdigit(): # Make sure there's a number before it
+            # 2. Find Quantity (Look for numbers anywhere)
+            if word.isdigit():
+                parsed_data["quantity"] = int(word)
+                
+            # 3. Find Price (Look for words near 'টাকা')
+            if 'টাকা' in word or 'taka' in word:
+                if i > 0 and words[i-1].isdigit(): 
                     parsed_data["price"] = int(words[i-1])
-                    break
 
-        # This is a fallback for simple messages like "hello 5"
-        if parsed_data["item_name"] == "hello" and parsed_data["quantity"] is None:
-            for word in words:
-                if word.isdigit():
-                    parsed_data["quantity"] = int(word)
-                    break
+        # Post-processing: If we found a quantity, ensure we have an item.
+        # This simplifies the logic by assuming the item is found somewhere near the number.
+        if parsed_data["quantity"] and not parsed_data["item_name"]:
+            # This is a hack for a messy parse: assume the next word is the item
+            next_index = words.index(str(parsed_data["quantity"])) + 1
+            if next_index < len(words):
+                if 'চাল' in words[next_index] or 'চান' in words[next_index]:
+                    parsed_data["item_name"] = 'চাল'
 
     except Exception as e:
         print(f"Parser Error: {e}")
-        # Don't stop, just return what we found
-
+        
     return parsed_data
 # --- END OF NEW FUNCTION ---
 
+# --- NEW FUNCTION FOR DAY 5 ---
+def transcribe_image_ocr(image_url: str) -> str:
+    """Downloads an image from Twilio and uses EasyOCR to read handwritten text."""
+    try:
+        # 1. Download the protected Twilio image
+        image_response = requests.get(image_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        image_response.raise_for_status()
+        
+        # 2. Convert the downloaded image data (bytes) into a format CV2 can read
+        image_array = np.frombuffer(image_response.content, np.uint8)
+        img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+    except Exception as e:
+        print(f"Error downloading or processing image: {e}")
+        return "ERROR: Could not read image file."
+
+    try:
+        # 3. Use EasyOCR to read the text from the image
+        # 'detail = 0' makes it faster and just returns a list of strings
+        result = ocr_reader.readtext(img, detail=0)
+        
+        # 4. Stitch all the found text blocks into one single string
+        transcribed_text = " ".join(result)
+        return transcribed_text
+        
+    except Exception as e:
+        print(f"Error during OCR processing: {e}")
+        return "ERROR: AI service failed."
+# --- END OF NEW FUNCTION ---
 
 @app.get("/")
 def read_root():
@@ -119,63 +155,91 @@ def read_test():
     return {"message": "Success! The ngrok tunnel is working!"}
 
 
-# --- UPDATED WEBHOOK FOR DAY 4 ---
+# --- UPDATED WEBHOOK FOR DAY 5 ---
 @app.post("/webhook")
 async def webhook(
     From: str = Form(...), 
     Body: str = Form(...),
     NumMedia: int = Form(0),
-    MediaUrl0: Optional[str] = Form(None)
+    MediaUrl0: Optional[str] = Form(None),
+    MediaContentType0: Optional[str] = Form(None)
 ):
 
     print(f"--- New Request from {From} ---")
     response = MessagingResponse()
+    
+    # This variable will be set by one of the paths
+    reply_message = "" 
 
     if NumMedia > 0 and MediaUrl0 is not None:
-        # It's a voice note!
-        print("Media message received. Transcribing...")
+        # --- THIS ENTIRE BLOCK IS NOW INDENTED ---
+        transcribed_text = ""
+        
+        # Check if the media content type contains "image"
+        if MediaContentType0 and "image" in MediaContentType0:
+            # IT'S AN IMAGE!
+            print("Image message received. Transcribing with OCR...")
+            transcribed_text = transcribe_image_ocr(MediaUrl0)
 
-        # Step 1: Transcribe the audio
-        transcribed_text = transcribe_audio_google(MediaUrl0)
+        # Check if the media content type contains "audio" or "ogg"
+        elif MediaContentType0 and ("audio" in MediaContentType0 or "ogg" in MediaContentType0):
+            # IT'S A VOICE NOTE!
+            print("Audio message received. Transcribing with Google...")
+            transcribed_text = transcribe_audio_google(MediaUrl0)
+
+        else:
+            # It's some other media (video, gif?) we don't support
+            print(f"Unsupported media type: {MediaContentType0}")
+            reply_message = "I can only understand voice notes and photos of ledgers."
+            response.message(reply_message)
+            return Response(content=str(response), media_type="application/xml")
+
+        # --- From here, the Day 4 logic is the same (and also indented) ---
+        
         print(f"Transcribed Text: {transcribed_text}")
 
         # Step 2: Parse the text to get data
         parsed_data = parse_message(transcribed_text)
         print(f"Parsed Data: {parsed_data}")
-
+        
         item = parsed_data.get("item_name")
         quantity = parsed_data.get("quantity")
-
+        
         # Step 3: Use the data!
         if item and quantity:
             # We have an item and a quantity! Let's update stock.
             print(f"Updating stock for {item}...")
             stock_update = database.update_stock(item, quantity)
-
+            
             if "error" in stock_update:
                 reply_message = f"Error: {stock_update['error']}"
             else:
                 # This is the "Smart Alert"!
                 new_stock = stock_update['new_stock']
                 reply_message = f"✅ Sale logged: {quantity} {item}. \nNew stock is: {new_stock}."
-
+                
                 if stock_update['alert_needed']:
                     # Add the alert!
                     reply_message += f"\n\n🚨 LOW STOCK ALERT! 🚨\nYour stock for {item} is at {new_stock}. Time to reorder!"
-
+        
         elif item and not quantity:
             # Found item, but no quantity
             reply_message = f"I heard you mention '{item}', but I didn't understand the quantity. Try '৫ কেজি চাল' (5 kg rice)."
-        else:
-            # Just random speech
+        
+        elif not transcribed_text.startswith("ERROR:"):
+            # Just random speech that wasn't an error
             reply_message = f"I heard: '{transcribed_text}' \n(I only understand sales, like '৫ কেজি চাল ২৫০ টাকা')"
+        
+        else:
+            # This catches errors from transcription
+            reply_message = transcribed_text # e.g., "ERROR: Could not convert audio file."
 
     else:
-        # It's a plain text message
+        # It's a plain text message (Day 2 logic)
         print(f"Text message received: {Body}")
         database.save_message(From, Body)
-        reply_message = f"You sent: '{Body}'. Send me a voice note!"
+        reply_message = f"You sent: '{Body}'. Send me a voice note or photo!"
 
-    # Send the reply
+    # Send the reply (This runs for all paths)
     response.message(reply_message)
     return Response(content=str(response), media_type="application/xml")
